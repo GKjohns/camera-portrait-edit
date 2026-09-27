@@ -1,0 +1,114 @@
+{
+ "_doc": "Style recipes applied after the base correction (rotate/crop/WB from params). wb/split: CIELAB [a, b] offsets (+b warmer, +a magenta). hue: band -> [hue shift deg, sat delta, lum delta]; bands red 0, orange 30, yellow 55, green 110, aqua 175, blue 220, pink 330. sat/vib global deltas; skin_sat is the skin-mask sat delta (default 0 = skin excluded). curve: [in, out] points. clarity: [amount, blur sigma px @1080]. grain: [sigma, size px @1080]. vignette: [amount, inner radius]. halation: [L threshold, blur as fraction of width, R add, G add]. mono: RGB mix weights.",
+ "natural": {
+  "label": "Natural",
+  "vibe": "The base edit: honest color, gentle contrast, skin-protected vibrance."
+ },
+ "clean_editorial": {
+  "label": "Clean Editorial",
+  "vibe": "Bright, neutral, crisp. Magazine-clean without looking processed.",
+  "neutralize": 1.0,
+  "wb": [0, 1.5],
+  "ev": 0.0,
+  "curve": [[0, 0.02], [0.25, 0.24], [0.75, 0.78], [0.9, 0.93], [1, 0.975]],
+  "sat": -0.05,
+  "vib": 0.08,
+  "hue": {
+   "green": [-8, -0.2, 0],
+   "aqua": [-4, -0.12, 0],
+   "orange": [0, -0.05, 0.03],
+   "blue": [0, -0.1, 0]
+  },
+  "vignette": [-0.08, 0.4],
+  "clarity": [0.1, 30],
+  "clarity_skin": false
+ },
+ "portra": {
+  "label": "Portra 400",
+  "vibe": "Soft film: lifted blacks, creamy highlights, gentle warm skin, muted greens.",
+  "wb": [0, 2.5],
+  "ev": 0.1,
+  "curve": [[0, 0.055], [0.15, 0.17], [0.5, 0.52], [0.7, 0.73], [1, 0.96]],
+  "sat": -0.12,
+  "hue": {
+   "green": [-15, -0.35, -0.05],
+   "aqua": [-8, -0.2, -0.03],
+   "blue": [-8, -0.25, 0],
+   "orange": [-3, -0.08, 0.02],
+   "pink": [0, -0.03, 0]
+  },
+  "split": {
+   "shadow": [-1, -2.5],
+   "highlight": [0, 2.5]
+  },
+  "grain": [0.011, 0.6],
+  "vignette": [-0.1, 0.35],
+  "clarity": [-0.05, 30],
+  "clarity_skin": true
+ },
+ "kodak_gold": {
+  "label": "Kodak Gold",
+  "vibe": "Warm golden-hour film, punchy yellows and reds, a touch of halation.",
+  "wb": [0, 3.0],
+  "ev": -0.08,
+  "curve": [[0, 0.04], [0.25, 0.22], [0.75, 0.8], [1, 0.97]],
+  "sat": 0.05,
+  "hue": {
+   "green": [-20, -0.2, 0],
+   "aqua": [-10, -0.12, 0.06],
+   "yellow": [0, 0.15, 0],
+   "red": [0, 0.12, 0],
+   "orange": [0, -0.12, 0],
+   "blue": [0, -0.1, 0]
+  },
+  "split": {
+   "shadow": [-1.5, 1],
+   "highlight": [0, 2]
+  },
+  "grain": [0.013, 0.8],
+  "halation": [0.92, 0.015, 0.08, 0.02],
+  "vignette": [-0.15, 0.35],
+  "neutralize": 1.0,
+  "skin_sat": -0.08
+ },
+ "muted_earth": {
+  "label": "Muted Earth",
+  "vibe": "Quiet, desaturated earth tones; moody but warm skin.",
+  "wb": [0, 2],
+  "ev": 0.0,
+  "curve": [[0, 0.03], [0.2, 0.18], [0.5, 0.5], [0.8, 0.82], [1, 0.95]],
+  "sat": -0.25,
+  "skin_sat": -0.08,
+  "hue": {
+   "green": [-20, -0.45, -0.08],
+   "aqua": [-12, -0.3, 0.05],
+   "blue": [-10, -0.4, 0],
+   "red": [0, -0.25, 0],
+   "pink": [0, -0.05, 0],
+   "yellow": [0, -0.2, 0]
+  },
+  "split": {
+   "shadow": [1, 3],
+   "highlight": [0, 1.5]
+  },
+  "grain": [0.01, 0.6],
+  "vignette": [-0.2, 0.2],
+  "clarity": [0.1, 30],
+  "clarity_skin": false
+ },
+ "warm_bw": {
+  "label": "Warm B&W",
+  "vibe": "Classic warm-toned black and white with fine grain.",
+  "mono": [0.34, 0.44, 0.22],
+  "ev": -0.16,
+  "curve": [[0, 0.03], [0.25, 0.21], [0.75, 0.81], [1, 0.97]],
+  "split": {
+   "shadow": [0, 1],
+   "highlight": [1, 3]
+  },
+  "grain": [0.02, 0.9],
+  "vignette": [-0.12, 0.35],
+  "clarity": [0.1, 30],
+  "clarity_skin": true
+ }
+}

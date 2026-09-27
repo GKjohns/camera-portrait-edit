@@ -6,6 +6,7 @@
   "crop_cx": 0.5,
   "crop_cy": 0.52,
   "skin_px": [540, 400],
+  "probes": {"skin": [540, 400], "shirt": [540, 900], "whites": [200, 1250]},
   "temp": 0.03,
   "tint": 0.0,
   "ev": 0.1,

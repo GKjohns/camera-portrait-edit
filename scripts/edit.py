@@ -3,6 +3,11 @@
 Usage:
   python edit.py params.json [--src FILE] [--out DIR] [--tag v1]   # draft: 1080x1350 + before/after
   python edit.py params.json --full [--src FILE] [--out DIR]        # full-res 4:5 + 1080x1350 IG export
+  python edit.py params.json --styles all [--full] --out DIR         # natural + every preset in styles.json
+  python edit.py params.json --style portra --style warm_bw          # selected presets (draft unless --full)
+
+Styles run on the base correction (rotate/crop/NR/WB from params) and are defined in styles.json.
+Optional params["probes"] = {"skin": [x, y], ...} in 1080x1350 coords prints Lab stats per style.
 
 RAW files (.arw .cr2 .cr3 .nef .raf .orf .rw2 .dng) are developed with rawpy if installed.
 """
@@ -45,7 +50,108 @@ def exif_bytes(src):
             continue
     return b''
 
-def develop(P, src, full):
+# ---------- style layer: one generic engine driven by styles.json ----------
+BANDS = dict(red=0, orange=30, yellow=55, green=110, aqua=175, blue=220, pink=330)
+STYLES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'styles.json')
+
+def load_styles(): return {k: v for k, v in json.load(open(STYLES_FILE)).items() if not k.startswith('_')}
+
+def blur(x, sig):
+    """Gaussian blur; large sigmas run on a downsampled copy for speed."""
+    if sig < 8: return cv2.GaussianBlur(x, (0, 0), sig)
+    f = sig / 4; h, w = x.shape[:2]
+    sm = cv2.resize(x, (max(1, int(w / f)), max(1, int(h / f))), interpolation=cv2.INTER_AREA)
+    return cv2.resize(cv2.GaussianBlur(sm, (0, 0), 4), (w, h), interpolation=cv2.INTER_LINEAR)
+
+def curve_lut(pts, n=1024):
+    x = np.linspace(0, 1, n); p = np.array(pts, dtype=np.float64)
+    y = np.interp(x, p[:, 0], p[:, 1])
+    y = np.convolve(np.pad(y, 40, mode='edge'), np.ones(41) / 41, 'same')[40:-40]   # smooth the kinks
+    return x, y.astype(np.float32)
+
+def skin_mask(s):
+    hsv = cv2.cvtColor(np.clip(s, 0, 1), cv2.COLOR_RGB2HSV); h, sa = hsv[..., 0], hsv[..., 1]
+    m = np.clip(np.minimum(h - 5, 50 - h) / 5, 0, 1) * np.clip(np.minimum(sa - 0.10, 0.68 - sa) / 0.08, 0, 1)
+    return cv2.GaussianBlur(m.astype(np.float32), (0, 0), 2)
+
+def lab_offset(s, off, w):
+    lab = cv2.cvtColor(np.clip(s, 0, 1), cv2.COLOR_RGB2Lab)
+    lab[..., 1] += off[0] * w; lab[..., 2] += off[1] * w
+    return cv2.cvtColor(lab, cv2.COLOR_Lab2RGB)
+
+def stylize(s, S, k):
+    """s: float32 sRGB 0-1 after base correction. k: pixel scale vs a 1080-wide export."""
+    if 'mono' in S: s = np.repeat((s @ np.array(S['mono'], dtype=np.float32))[..., None], 3, 2)
+    # exposure in linear light with a soft shoulder, so the window rolls off instead of clipping
+    lin = s2l(s) * 2 ** S.get('ev', 0); kn = S.get('knee', 0.7)
+    Y = lum(lin)[..., None]; Yc = np.where(Y > kn, kn + (1 - kn) * np.tanh((Y - kn) / (1 - kn)), Y)
+    s = l2s(lin * np.where(Y > 1e-6, Yc / np.maximum(Y, 1e-6), 1)).astype(np.float32)
+    if 'curve' in S:   # applied to luma as an additive shift: keeps chroma, so pastels don't bleach
+        Y = lum(s); s = s + (np.interp(Y, *curve_lut(S['curve'])) - Y)[..., None].astype(np.float32)
+    # white balance as Lab offsets (optionally neutralize bright low-chroma areas first)
+    lab = cv2.cvtColor(np.clip(s, 0, 1), cv2.COLOR_RGB2Lab)
+    wb = np.array(S.get('wb', [0, 0]), dtype=np.float32)
+    if S.get('neutralize'):
+        m = (lab[..., 0] > 70) & (np.hypot(lab[..., 1], lab[..., 2]) < 15)
+        if m.mean() > 0.01: wb -= S['neutralize'] * lab[m][:, 1:].mean(0)
+    if wb.any(): s = lab_offset(s, wb, np.clip(lab[..., 0] / 40, 0, 1))
+    # colour: per-band HSV shifts, then global sat/vibrance with skin handled separately
+    skin = skin_mask(s)
+    hsv = cv2.cvtColor(np.clip(s, 0, 1), cv2.COLOR_RGB2HSV); h = hsv[..., 0]
+    dh = np.zeros_like(h); ds = np.zeros_like(h); dl = np.zeros_like(h)
+    for band, (sh, sa, lu) in S.get('hue', {}).items():
+        d = (h - BANDS[band] + 180) % 360 - 180; m = np.exp(-0.5 * (d / 22) ** 2)
+        if band != 'orange': m = m * (1 - skin)   # only the orange band is allowed to touch skin
+        dh += m * sh; ds += m * sa; dl += m * lu
+    f = 1 + S.get('sat', 0) + S.get('vib', 0) * (1 - np.clip(hsv[..., 1] / 0.7, 0, 1))
+    f = f * (1 - skin) + (1 + S.get('skin_sat', 0)) * skin
+    hsv[..., 0] = (h + dh) % 360
+    hsv[..., 1] = np.clip(hsv[..., 1] * (1 + ds) * f, 0, 1)
+    hsv[..., 2] = hsv[..., 2] * (1 + dl)
+    s = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+    # split tone + clarity on Lab L
+    lab = cv2.cvtColor(np.clip(s, 0, 1), cv2.COLOR_RGB2Lab); L = lab[..., 0] / 100
+    for key, wgt in (('shadow', (1 - L) ** 2), ('highlight', L ** 2)):
+        o = S.get('split', {}).get(key)
+        if o: lab[..., 1] += o[0] * wgt; lab[..., 2] += o[1] * wgt
+    if 'clarity' in S:
+        amt, sig = S['clarity']; w = 4 * L * (1 - L)
+        if not S.get('clarity_skin', True): w = w * (1 - skin)
+        lab[..., 0] += 100 * amt * 3 * (L - blur(L, sig * k)) * w
+    s = cv2.cvtColor(lab, cv2.COLOR_Lab2RGB)
+    if 'halation' in S:
+        thr, rad, r, g = S['halation']; hl = np.clip((lum(s) - thr) / (1 - thr), 0, 1)
+        glow = blur(hl, rad * s.shape[1])[..., None] * np.array([r, g, 0], dtype=np.float32)
+        s = 1 - (1 - np.clip(s, 0, 1)) * (1 - glow)
+    if 'vignette' in S:
+        amt, inner = S['vignette']; H, W = s.shape[:2]
+        yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+        r = np.hypot((xx - W / 2) / (W / 2), (yy - H / 2) / (H / 2)) / np.sqrt(2)
+        s = s * (1 + amt * np.clip((r - inner) / (1 - inner), 0, 1) ** 2)[..., None]
+    return np.clip(s, 0, 1).astype(np.float32)
+
+def add_grain(im, S, k, seed=7):
+    """Luminance grain at output resolution, weighted to the midtones; dithers lifted blacks."""
+    a = np.asarray(im, dtype=np.float32) / 255
+    if S and 'grain' in S:
+        sig, size = S['grain']
+        n = np.random.default_rng(seed).standard_normal(a.shape[:2]).astype(np.float32)
+        n = cv2.GaussianBlur(n, (0, 0), max(0.3, size * k)); n *= sig / (n.std() + 1e-8)
+        Y = lum(a)[..., None]; a = a * (1 + n[..., None] * 4 * (1 - Y))   # ~4Y(1-Y) in absolute terms, chroma-neutral
+    return Image.fromarray((np.clip(a, 0, 1) * 255 + 0.5).astype(np.uint8))
+
+def to_img(a): return Image.fromarray((np.clip(a, 0, 1) * 255 + 0.5).astype(np.uint8))
+
+def probe_report(ig, base, probes):
+    """Print Lab stats for named probe points ([x, y] in 1080x1350 coords) vs the uncorrected crop."""
+    labs = [cv2.cvtColor(np.asarray(x, dtype=np.float32) / 255, cv2.COLOR_RGB2Lab) for x in (base, ig)]
+    out = []
+    for name, (x, y) in probes.items():
+        (L0, _, _), (L, A, B) = [l[y - 12:y + 12, x - 12:x + 12].reshape(-1, 3).mean(0) for l in labs]
+        out.append(f'{name}: L{L:.0f} ({(L / L0 - 1) * 100:+.0f}%) a{A:.1f} b{B:.1f} hue{np.degrees(np.arctan2(B, A)):.0f} C{np.hypot(A, B):.1f}')
+    print('   ' + ' | '.join(out))
+
+def develop(P, src, full, style=None):
     im, icc = load(src, full)
     if P.get('rotate', 0): im = im.rotate(P['rotate'], resample=Image.BICUBIC, expand=False)
     W, H = im.size
@@ -67,6 +173,8 @@ def develop(P, src, full):
     # white balance in linear light: temp + warmer, tint + magenta
     t, g = P.get('temp', 0), P.get('tint', 0)
     lin = lin * np.array([1 + t, 1 - g, 1 - t], dtype=np.float32)
+    if style is not None:   # style layer replaces the natural grade; base = rotate/crop/NR/WB
+        return stylize(l2s(lin).astype(np.float32), style, a.shape[1] / 1080), icc
     lin = lin * 2 ** P.get('ev', 0)
     # soft highlight rolloff above the knee (luma-based, hue-preserving)
     kn = P.get('hl_knee', 0.8)
@@ -98,7 +206,7 @@ def develop(P, src, full):
     Ys = np.clip(lum(s)[..., None], 0, 1)
     s = s + np.array(P.get('shadow_tint', [0, 0, 0]), dtype=np.float32) * (1 - Ys) ** 2 \
           + np.array(P.get('hl_tint', [0, 0, 0]), dtype=np.float32) * Ys ** 2
-    return Image.fromarray((np.clip(s, 0, 1) * 255 + 0.5).astype(np.uint8)), icc
+    return s.astype(np.float32), icc
 
 def sharpen(im, amt, rad, thr=2):
     return im.filter(ImageFilter.UnsharpMask(radius=rad, percent=int(amt), threshold=thr))
@@ -112,6 +220,8 @@ def main():
     ap.add_argument('--out', default='edited', help='output dir (default ./edited)')
     ap.add_argument('--full', action='store_true', help='final full-res export')
     ap.add_argument('--tag', default='v1', help='draft label, e.g. v2')
+    ap.add_argument('--style', action='append', help='style preset from styles.json (repeatable)')
+    ap.add_argument('--styles', help='"all" or comma list; writes <name>_<style>_* plus <name>_original_1080x1350.jpg')
     A = ap.parse_args()
     P = json.load(open(A.params))
     src = os.path.expanduser(A.src or P['src'])
@@ -119,8 +229,29 @@ def main():
         src = os.path.join(os.path.dirname(os.path.abspath(A.params)), src)
     name = P.get('name') or os.path.splitext(os.path.basename(src))[0]
     os.makedirs(A.out, exist_ok=True)
-    out, icc = develop(P, src, A.full)
-    kw = dict(quality=92, icc_profile=icc, exif=exif_bytes(src), subsampling=0)
+    kw = dict(quality=92, icc_profile=None, exif=exif_bytes(src), subsampling=0)
+    B = {k: P[k] for k in ('rotate', 'crop_w', 'crop_cx', 'crop_cy') if k in P}; B['hl_knee'] = 1.01
+    ST = load_styles()
+    names = (A.style or []) + ([] if not A.styles else list(ST) if A.styles == 'all' else A.styles.split(','))
+    if names:   # style mode: natural + presets, plus an ungraded crop for before/after
+        base, icc = develop(B, src, A.full); base = to_img(base).resize((1080, 1350), Image.LANCZOS)
+        kw['icc_profile'] = icc
+        if A.full: base.save(os.path.join(A.out, f'{name}_original_1080x1350.jpg'), **kw)
+        for st in names:
+            S = ST[st]; out, _ = develop(P, src, A.full, None if st == 'natural' else S)
+            ig = add_grain(ig_version(to_img(out), P), S, 1)
+            if A.full:
+                fr = add_grain(sharpen(to_img(out), P.get('sharp_amt', 60), P.get('sharp_rad', 1.4)), S, out.shape[1] / 1080)
+                fr.save(os.path.join(A.out, f'{name}_{st}_full.jpg'), **kw)
+                p = os.path.join(A.out, f'{name}_{st}_1080x1350.jpg'); ig.save(p, **kw)
+            else:
+                os.makedirs(os.path.join(A.out, 'iter'), exist_ok=True)
+                p = os.path.join(A.out, 'iter', f'{name}_{st}_{A.tag}.jpg'); ig.save(p, quality=90)
+            print('saved', p)
+            if P.get('probes'): probe_report(ig, base, P['probes'])
+        return
+    out, icc = develop(P, src, A.full); out = to_img(out)
+    kw['icc_profile'] = icc
     if A.full:
         fr = sharpen(out, P.get('sharp_amt', 60), P.get('sharp_rad', 1.4))
         p1 = os.path.join(A.out, f'{name}_4x5_full.jpg'); fr.save(p1, **kw)
@@ -129,8 +260,7 @@ def main():
     d = os.path.join(A.out, 'iter'); os.makedirs(d, exist_ok=True)
     ig = ig_version(out, P); p = os.path.join(d, f'{name}_{A.tag}.jpg'); ig.save(p, quality=90)
     # before/after: same rotation + crop, no grade
-    B = {k: P[k] for k in ('rotate', 'crop_w', 'crop_cx', 'crop_cy') if k in P}; B['hl_knee'] = 1.01
-    b, _ = develop(B, src, False); b = b.resize((540, 675), Image.LANCZOS)
+    b, _ = develop(B, src, False); b = to_img(b).resize((540, 675), Image.LANCZOS)
     S = Image.new('RGB', (1090, 675), 'white'); S.paste(b, (0, 0)); S.paste(ig.resize((540, 675), Image.LANCZOS), (550, 0))
     pb = os.path.join(d, f'{name}_{A.tag}_ba.jpg'); S.save(pb, quality=88)
     print('draft', p); print('before/after', pb)
