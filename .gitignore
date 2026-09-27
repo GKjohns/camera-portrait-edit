@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.jpg
+*.JPG
+*.jpeg
+*.png
+*.arw
+*.ARW
+*.dng
+*.cr3
+*.nef
+edited/
